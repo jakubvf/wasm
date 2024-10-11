@@ -1,30 +1,43 @@
 const std = @import("std");
 
 const SectionID = enum(u8) {
-    custom_id,
-    type_id,
-    import_id,
-    function_id,
-    table_id,
-    memory_id,
-    global_id,
-    export_id,
-    start_id,
-    element_id,
-    code_id,
-    data_id,
+    custom_section,
+    type_section = 0x1,
+    import_section = 0x2,
+    function_section = 0x3,
+    table_section = 0x4,
+    memory_section = 0x5,
+    global_section = 0x6,
+    export_section = 0x7,
+    start_section = 0x8,
+    element_section = 0x9,
+    code_section = 0xa,
+    data_section = 0xb,
 };
 
 const Section = struct {
     id: SectionID,
     size: u32, // LE
-    contents: []u8,
+    contents: SectionContents,
+};
+
+const SectionContents = union(enum) {
+    type_section: TypeSection,
+    import_section: ImportSection,
+    function_section: FunctionSection,
+    memory_section: MemorySection,
+    global_section: GlobalSection,
+    export_section: ExportSection,
+    start_section: StartSection,
+    code_section: CodeSection,
 };
 
 const TypeSection = struct {
-    id: u8 = 0x1,
-    size: u32, // LE
     types: []FunctionType,
+};
+
+const TypeTag = enum(u8) {
+    func = 0x60,
 };
 
 const FunctionType = struct {
@@ -41,8 +54,6 @@ const ValueType = enum(u8) {
 };
 
 const ImportSection = struct {
-    id: u8 = 0x2,
-    size: u32, // LE
     imports: []Import,
 };
 
@@ -53,29 +64,23 @@ const Import = struct {
 };
 
 const FunctionSection = struct {
-    id: u8 = 0x3,
-    size: u32, // LE
-    types: []TypeIndex, // []LE
+    types: []TypeIndex,
 };
 
-const TypeIndex = u32; // LE
+const TypeIndex = u32;
 
 // TODO: Table (ID 4) and element  (ID 9) sections
 
 const MemorySection = struct {
-    id: u8 = 0x5,
-    size: u32, // LE
     memories: []Limits,
 };
 
 const Limits = struct {
-    min: u32, // LE
-    max: ?u32, // LE
+    min: u32,
+    max: ?u32,
 };
 
 const GlobalSection = struct {
-    id: u8 = 0x6,
-    size: u32, // LE
     globals: []Global,
 };
 
@@ -87,8 +92,6 @@ const Global = struct {
 const Instruction = u8; // TODO
 
 const ExportSection = struct {
-    id: u8 = 0x7,
-    size: u32, // LE
     exports: []Export,
 };
 
@@ -106,15 +109,12 @@ const ImportExportTag = enum(u8) {
 };
 
 const StartSection = struct {
-    id: u8 = 0x8,
     size: u32, // LE
     function_index: u32, // LE
 };
 
 const CodeSection = struct {
-    id: u8 = 10,
-    size: u32, // LE
-    codes: []Code,
+    functions: []Code,
 };
 
 const Code = struct {
@@ -129,13 +129,88 @@ const Local = struct {
 };
 
 const wasm_binary_magic = 0x0061736d;
-const wasm_binary_version = 0x1; // LE
+const wasm_binary_version = 0x1;
 
 const Module = struct {
     magic: u32,
     version: u32,
     sections: []Section,
 };
+
+fn parseSection(reader: anytype, allocator: std.mem.Allocator) !Section {
+    var section: Section = undefined;
+    section.id = try reader.readEnum(SectionID, .little);
+    section.size = try reader.readInt(u8, .little);
+
+    switch (section.id) {
+        .type_section => {
+            section.contents = .{ .type_section = undefined };
+            const ts = &section.contents.type_section;
+            const num_types = try reader.readInt(u8, .little);
+            ts.types = try allocator.alloc(FunctionType, num_types);
+
+            for (ts.types) |*t| {
+                t.tag = try reader.readInt(u8, .little);
+                const num_params = try reader.readInt(u8, .little);
+                t.params = try allocator.alloc(ValueType, num_params);
+                for (t.params) |*param| {
+                    param.* = try reader.readEnum(ValueType, .little);
+                }
+                const num_results = try reader.readInt(u8, .little);
+                t.results = try allocator.alloc(ValueType, num_results);
+                for (t.results) |*result| {
+                    result.* = try reader.readEnum(ValueType, .little);
+                }
+            }
+        },
+        .function_section => {
+            section.contents = .{ .function_section = undefined };
+            const fs = &section.contents.function_section;
+            const num_functions = try reader.readInt(u8, .little);
+            fs.types = try allocator.alloc(TypeIndex, num_functions);
+            for (fs.types) |*type_index| {
+                type_index.* = try reader.readInt(u8, .little);
+            }
+        },
+        .export_section => {
+            section.contents = .{ .export_section = undefined };
+            const es = &section.contents.export_section;
+            const num_exports = try reader.readInt(u8, .little);
+            es.exports = try allocator.alloc(Export, num_exports);
+            for (es.exports) |*e| {
+                const export_name_len = try reader.readInt(u8, .little);
+                e.name = try allocator.alloc(u8, export_name_len);
+                if (try reader.readAll(e.name) != export_name_len) {
+                    return error.InvalidWasmFile;
+                }
+                e.tag = try reader.readEnum(ImportExportTag, .little);
+                e.index = try reader.readInt(u8, .little);
+            }
+        },
+        .code_section => {
+            section.contents = .{ .code_section = undefined };
+            const cs = &section.contents.code_section;
+            const num_functions = try reader.readInt(u8, .little);
+            cs.functions = try allocator.alloc(Code, num_functions);
+            for (cs.functions) |*f| {
+                f.size = try reader.readInt(u8, .little);
+                const num_locals = try reader.readInt(u8, .little);
+                f.locals = try allocator.alloc(Local, num_locals);
+                for (f.locals) |*local| {
+                    std.debug.assert(false); // Untested
+                    local.count = try reader.readInt(u8, .little);
+                    local.type = try reader.readEnum(ValueType, .little);
+                }
+                f.body = try allocator.alloc(Instruction, f.size - 1); // - 1 for locals
+                if (try reader.readAll(f.body) != f.size - 1) {
+                    return error.InvalidWasmFile;
+                }
+            }
+        },
+        else => return error.UnsupportedSection,
+    }
+    return section;
+}
 
 pub fn main() !void {
     const allocator = std.heap.c_allocator;
@@ -149,63 +224,9 @@ pub fn main() !void {
     if (try reader.readInt(u32, .little) != 1) {
         return error.UnsupportedWasmVersion;
     }
-    // Type section
-    const section_code = try reader.readInt(u8, .little);
-    std.debug.print("Section code: {}\n", .{section_code});
-    const section_size = try reader.readInt(u8, .little);
-    std.debug.print("Section size: {}\n", .{section_size});
-    const num_types = try reader.readInt(u8, .little);
-    std.debug.print("Number of types: {}\n", .{num_types});
-    const function_type = try reader.readInt(u8, .little);
-    std.debug.print("Function type: {}\n", .{function_type});
-    const num_params = try reader.readInt(u8, .little);
-    std.debug.print("Number of params: {}\n", .{num_params});
-    const param_type1 = try reader.readInt(u8, .little);
-    std.debug.print("Param type: {}\n", .{param_type1});
-    const param_type2 = try reader.readInt(u8, .little);
-    std.debug.print("Param type: {}\n", .{param_type2});
-    const num_results = try reader.readInt(u8, .little);
-    std.debug.print("Number of results: {}\n", .{num_results});
-    const result_type = try reader.readInt(u8, .little);
-    std.debug.print("Result type: {}\n", .{result_type});
-    // Function section
-    const section_code2 = try reader.readInt(u8, .little);
-    std.debug.print("Section code: {}\n", .{section_code2});
-    const section_size2 = try reader.readInt(u8, .little);
-    std.debug.print("Section size: {}\n", .{section_size2});
-    const num_functions = try reader.readInt(u8, .little);
-    std.debug.print("Number of functions: {}\n", .{num_functions});
-    const signature_index = try reader.readInt(u8, .little);
-    std.debug.print("Signature index: {}\n", .{signature_index});
-    // Export section
-    const section_code3 = try reader.readInt(u8, .little);
-    std.debug.print("Section code: {}\n", .{section_code3});
-    const section_size3 = try reader.readInt(u8, .little);
-    std.debug.print("Section size: {}\n", .{section_size3});
-    const num_exports = try reader.readInt(u8, .little);
-    std.debug.print("Number of exports: {}\n", .{num_exports});
-    const export_name_len = try reader.readInt(u8, .little);
-    std.debug.print("Export name length: {}\n", .{export_name_len});
-    const export_name = try allocator.alloc(u8, export_name_len);
-    if (try reader.read(export_name) == 0) {
-        return error.InvalidWasmFile;
-    }
-    std.debug.print("Export name: {s}\n", .{export_name});
-    const export_kind = try reader.readInt(u8, .little);
-    std.debug.print("Export kind: {}\n", .{export_kind});
-    const export_index = try reader.readInt(u8, .little);
-    std.debug.print("Export index: {}\n", .{export_index});
-    // Code section
-    const section_code4 = try reader.readInt(u8, .little);
-    std.debug.print("Section code: {}\n", .{section_code4});
-    const section_size4 = try reader.readInt(u8, .little);
-    std.debug.print("Section size: {}\n", .{section_size4});
-    const num_functions2 = try reader.readInt(u8, .little);
-    std.debug.print("Number of functions: {}\n", .{num_functions2});
-    const body_size = try reader.readInt(u8, .little);
-    std.debug.print("Body size: {}\n", .{body_size});
-    const locals_count = try reader.readInt(u8, .little);
-    std.debug.print("Locals count: {}\n", .{locals_count});
-    try reader.skipUntilDelimiterOrEof('\x0b');
+    std.debug.print("{any}\n", .{try parseSection(reader, allocator)});
+    std.debug.print("{any}\n", .{try parseSection(reader, allocator)});
+    std.debug.print("{any}\n", .{try parseSection(reader, allocator)});
+    std.debug.print("{any}\n", .{try parseSection(reader, allocator)});
     std.debug.print("End? {}\n", .{try file.getEndPos() == try file.getPos()});
 }
