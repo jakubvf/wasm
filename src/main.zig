@@ -87,9 +87,14 @@ const GlobalSection = struct {
 const Global = struct {
     type: ValueType,
     mutable: bool,
-    init: []Instruction,
+    init: []u8,
 };
-const Instruction = u8; // TODO
+const Opcode = struct {
+    const @"unreachable" = 0x00;
+    const get_local = 0x20;
+    const i32_add = 0x6a;
+    const end = 0x0b;
+};
 
 const ExportSection = struct {
     exports: []Export,
@@ -120,7 +125,7 @@ const CodeSection = struct {
 const Code = struct {
     size: u32, // LE
     locals: []Local,
-    body: []Instruction,
+    body: []u8,
 };
 
 const Local = struct {
@@ -201,7 +206,7 @@ fn parseSection(reader: anytype, allocator: std.mem.Allocator) !Section {
                     local.count = try reader.readInt(u8, .little);
                     local.type = try reader.readEnum(ValueType, .little);
                 }
-                f.body = try allocator.alloc(Instruction, f.size - 1); // - 1 for locals
+                f.body = try allocator.alloc(u8, f.size - 1); // - 1 for locals count
                 if (try reader.readAll(f.body) != f.size - 1) {
                     return error.InvalidWasmFile;
                 }
@@ -211,6 +216,17 @@ fn parseSection(reader: anytype, allocator: std.mem.Allocator) !Section {
     }
     return section;
 }
+
+const Value = union(enum) {
+    i32: i32,
+};
+
+const VirtualMachine = struct {
+    code: []const u8,
+    ii: u32,
+    stack: std.ArrayList(Value),
+    locals: std.ArrayList(Value),
+};
 
 pub fn main() !void {
     const allocator = std.heap.c_allocator;
@@ -227,6 +243,45 @@ pub fn main() !void {
     std.debug.print("{any}\n", .{try parseSection(reader, allocator)});
     std.debug.print("{any}\n", .{try parseSection(reader, allocator)});
     std.debug.print("{any}\n", .{try parseSection(reader, allocator)});
-    std.debug.print("{any}\n", .{try parseSection(reader, allocator)});
+    const code_section = try parseSection(reader, allocator);
+    std.debug.print("{any}\n", .{code_section});
     std.debug.print("End? {}\n", .{try file.getEndPos() == try file.getPos()});
+
+    var vm = VirtualMachine{
+        .code = code_section.contents.code_section.functions[0].body,
+        .ii = 0,
+        .stack = std.ArrayList(Value).init(allocator),
+        .locals = std.ArrayList(Value).init(allocator),
+    };
+    try vm.locals.append(.{ .i32 = 1 });
+    try vm.locals.append(.{ .i32 = 2 });
+    while (vm.ii < vm.code.len) {
+        const opcode = vm.code[vm.ii];
+        vm.ii += 1;
+        switch (opcode) {
+            Opcode.get_local => {
+                const local_index = vm.code[vm.ii];
+                try vm.stack.append(.{ .i32 = local_index });
+                vm.ii += 1;
+                std.debug.print("get_local {}\n", .{local_index});
+            },
+            Opcode.i32_add => {
+                const b = vm.stack.pop().i32;
+                const a = vm.stack.pop().i32;
+                const result = vm.locals.items[@intCast(a)].i32 + vm.locals.items[@intCast(b)].i32;
+                try vm.stack.append(.{ .i32 = result });
+                std.debug.print("i32.add {} + {} = {}\n", .{ a, b, result });
+            },
+            Opcode.end => {
+                for (vm.stack.items) |i| {
+                    std.debug.print("stack {}\n", .{i});
+                }
+                std.debug.print("end\n", .{});
+            },
+            else => {
+                std.debug.print("Unknown opcode {}\n", .{opcode});
+                return;
+            },
+        }
+    }
 }
