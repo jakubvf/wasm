@@ -91,8 +91,11 @@ const Global = struct {
 };
 const Opcode = struct {
     const @"unreachable" = 0x00;
+    const nop = 0x01;
+    const call = 0x10;
     const get_local = 0x20;
     const i32_add = 0x6a;
+    const i32_const = 0x41;
     const end = 0x0b;
 };
 
@@ -222,66 +225,94 @@ const Value = union(enum) {
 };
 
 const VirtualMachine = struct {
-    code: []const u8,
-    ii: u32,
     stack: std.ArrayList(Value),
+    frames: std.ArrayList(Frame),
+    code_section: CodeSection,
+    type_section: TypeSection,
+
+    pub fn execute(vm: *VirtualMachine, input: Frame) !void {
+        try vm.frames.append(input);
+
+        var idk = vm.frames.items[vm.frames.items.len - 1];
+        const reader = idk.code.reader();
+        while (try idk.code.getPos() != try idk.code.getEndPos()) {
+            const opcode = try reader.readByte();
+            switch (opcode) {
+                Opcode.get_local => {
+                    const local_index = try reader.readByte();
+                    try vm.stack.append(.{ .i32 = local_index });
+                    std.debug.print("get_local {}\n", .{local_index});
+                },
+                Opcode.i32_add => {
+                    const b = vm.stack.pop().i32;
+                    const a = vm.stack.pop().i32;
+                    const result = idk.locals.items[@intCast(a)].i32 + idk.locals.items[@intCast(b)].i32;
+                    try vm.stack.append(.{ .i32 = result });
+                    std.debug.print("i32.add {} + {} = {}\n", .{ a, b, result });
+                },
+                Opcode.i32_const => {
+                    const value = try std.leb.readILEB128(i32, reader);
+                    try vm.stack.append(.{ .i32 = value });
+                    std.debug.print("i32.const {}\n", .{value});
+                },
+                Opcode.call => {
+                    const func_idx = try reader.readByte();
+                    std.debug.print("call {}\n", .{func_idx});
+                    var frame = Frame{ .locals = std.ArrayList(Value).init(vm.stack.allocator), .code = .{ .buffer = vm.code_section.functions[func_idx].body, .pos = 0 } };
+                    for (vm.type_section.types[func_idx].params) |_| {
+                        try frame.locals.append(vm.stack.pop());
+                    }
+                    try vm.execute(frame);
+                },
+                Opcode.end => {
+                    for (vm.stack.items) |i| {
+                        std.debug.print("stack {}\n", .{i});
+                    }
+                    std.debug.print("end\n", .{});
+                    return;
+                },
+                else => {
+                    std.debug.print("Unknown opcode {}\n", .{opcode});
+                    return;
+                },
+            }
+        }
+    }
+};
+
+const Frame = struct {
+    code: std.io.FixedBufferStream([]const u8),
     locals: std.ArrayList(Value),
 };
 
 pub fn main() !void {
     const allocator = std.heap.c_allocator;
-    const file = try std.fs.cwd().openFile("test1.wasm", .{});
+    const file = try std.fs.cwd().openFile("test2.wasm", .{});
     defer file.close();
 
-    const reader = file.reader();
-    if (!try reader.isBytes("\x00asm")) {
+    const file_reader = file.reader();
+    if (!try file_reader.isBytes("\x00asm")) {
         return error.InvalidWasmFile;
     }
-    if (try reader.readInt(u32, .little) != 1) {
+    if (try file_reader.readInt(u32, .little) != 1) {
         return error.UnsupportedWasmVersion;
     }
-    std.debug.print("{any}\n", .{try parseSection(reader, allocator)});
-    std.debug.print("{any}\n", .{try parseSection(reader, allocator)});
-    std.debug.print("{any}\n", .{try parseSection(reader, allocator)});
-    const code_section = try parseSection(reader, allocator);
+    const type_section = try parseSection(file_reader, allocator);
+    std.debug.print("{any}\n", .{type_section});
+    std.debug.print("{any}\n", .{try parseSection(file_reader, allocator)});
+    std.debug.print("{any}\n", .{try parseSection(file_reader, allocator)});
+    const code_section = try parseSection(file_reader, allocator);
     std.debug.print("{any}\n", .{code_section});
-    std.debug.print("End? {}\n", .{try file.getEndPos() == try file.getPos()});
+    std.debug.print("reached end? {}\n", .{try file.getEndPos() == try file.getPos()});
 
     var vm = VirtualMachine{
-        .code = code_section.contents.code_section.functions[0].body,
-        .ii = 0,
+        .frames = std.ArrayList(Frame).init(allocator),
         .stack = std.ArrayList(Value).init(allocator),
-        .locals = std.ArrayList(Value).init(allocator),
+        .code_section = code_section.contents.code_section,
+        .type_section = type_section.contents.type_section,
     };
-    try vm.locals.append(.{ .i32 = 1 });
-    try vm.locals.append(.{ .i32 = 2 });
-    while (vm.ii < vm.code.len) {
-        const opcode = vm.code[vm.ii];
-        vm.ii += 1;
-        switch (opcode) {
-            Opcode.get_local => {
-                const local_index = vm.code[vm.ii];
-                try vm.stack.append(.{ .i32 = local_index });
-                vm.ii += 1;
-                std.debug.print("get_local {}\n", .{local_index});
-            },
-            Opcode.i32_add => {
-                const b = vm.stack.pop().i32;
-                const a = vm.stack.pop().i32;
-                const result = vm.locals.items[@intCast(a)].i32 + vm.locals.items[@intCast(b)].i32;
-                try vm.stack.append(.{ .i32 = result });
-                std.debug.print("i32.add {} + {} = {}\n", .{ a, b, result });
-            },
-            Opcode.end => {
-                for (vm.stack.items) |i| {
-                    std.debug.print("stack {}\n", .{i});
-                }
-                std.debug.print("end\n", .{});
-            },
-            else => {
-                std.debug.print("Unknown opcode {}\n", .{opcode});
-                return;
-            },
-        }
-    }
+    try vm.execute(Frame{
+        .locals = std.ArrayList(Value).init(allocator),
+        .code = .{ .buffer = vm.code_section.functions[1].body, .pos = 0 },
+    });
 }
