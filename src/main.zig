@@ -52,7 +52,6 @@ const ExportSection = struct {
 };
 
 const StartSection = struct {
-    size: u32,
     function_index: u32,
 };
 
@@ -84,6 +83,7 @@ const Module = struct {
     code_section: ?CodeSection = null,
     // TODO: data section
     // TODO: data count section
+    bytecode: []const u8 = undefined,
 
     const Section = union(enum) {
         type_section: TypeSection,
@@ -98,6 +98,7 @@ const Module = struct {
 
     pub fn init(allocator: std.mem.Allocator, bytecode: []const u8) !Module {
         var module = Module{};
+        module.bytecode = bytecode;
 
         var fbs = std.io.fixedBufferStream(bytecode);
         const reader = fbs.reader();
@@ -150,16 +151,24 @@ const Module = struct {
             for (es.exports) |e| {
                 allocator.free(e.name);
             }
+            allocator.free(es.exports);
         }
         if (module.code_section) |cs| {
             for (cs.functions) |f| {
-                for (f.locals) |l| {
-                    allocator.free(l);
-                }
                 allocator.free(f.locals);
                 allocator.free(f.body);
             }
             allocator.free(cs.functions);
+        }
+        if (module.type_section) |ts| {
+            for (ts.types) |t| {
+                allocator.free(t.params);
+                allocator.free(t.returns);
+            }
+            allocator.free(ts.types);
+        }
+        if (module.function_section) |fs| {
+            allocator.free(fs.types);
         }
     }
 
@@ -263,6 +272,10 @@ const Module = struct {
                     e.index = try reader.readInt(u8, .little);
                 }
             },
+            .start_section => {
+                const ss = &section.start_section;
+                ss.function_index = try std.leb.readULEB128(u32, reader);
+            },
             .code_section => {
                 const cs = &section.code_section;
                 const num_functions = try reader.readInt(u8, .little);
@@ -306,6 +319,38 @@ const VirtualMachine = struct {
     frames: std.ArrayList(Frame),
     module: Module,
 
+    const uleb = u32;
+    const ileb = i32;
+
+    pub fn skipUntilElse(vm: *VirtualMachine, fbs: *std.io.FixedBufferStream([]const u8)) !void {
+        _ = vm;
+        var depth: u32 = 1;
+        const reader = fbs.reader();
+        while (try fbs.getPos() != try fbs.getEndPos()) {
+            const opcode: std.wasm.Opcode = @enumFromInt(try reader.readByte());
+            switch (opcode) {
+                .call,
+                .local_get => {
+                    _ = try std.leb.readULEB128(uleb, reader);
+                },
+                .i32_const => {
+                    _ = try std.leb.readILEB128(ileb, reader);
+                },
+                .@"if" => {
+                    depth += 1;
+                    _ = try std.leb.readULEB128(uleb, reader);
+                },
+                .@"else" => {
+                    depth -= 1;
+                    if (depth == 0) {
+                        return;
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
     pub fn execute(vm: *VirtualMachine, input: Frame) !void {
         try vm.frames.append(input);
         defer {
@@ -319,24 +364,45 @@ const VirtualMachine = struct {
             const opcode: std.wasm.Opcode = @enumFromInt(try reader.readByte());
             switch (opcode) {
                 .local_get => {
-                    const local_index = try reader.readByte();
-                    try vm.stack.append(.{ .i32 = local_index });
+                    const local_index = try std.leb.readULEB128(uleb, reader);
+                    try vm.stack.append(idk.locals.items[local_index]);
                     std.debug.print("local_get idx({}) => {any}\n", .{ local_index, vm.stack.getLast() });
                 },
                 .i32_add => {
                     const b = vm.stack.pop().i32;
                     const a = vm.stack.pop().i32;
-                    const result = idk.locals.items[@intCast(a)].i32 + idk.locals.items[@intCast(b)].i32;
+                    // const result = idk.locals.items[@intCast(a)].i32 + idk.locals.items[@intCast(b)].i32;
+                    const result = a + b;
                     try vm.stack.append(.{ .i32 = result });
-                    std.debug.print("i32_add idx({}) + idx({}) => {}\n", .{ a, b, result });
+                    std.debug.print("i32_add {} + {} => {}\n", .{ a, b, result });
                 },
                 .i32_const => {
                     const value = try std.leb.readILEB128(i32, reader);
                     try vm.stack.append(.{ .i32 = value });
                     std.debug.print("i32_const {}\n", .{value});
                 },
+                .i32_eq => {
+                    const b = vm.stack.pop().i32;
+                    const a = vm.stack.pop().i32;
+                    const result = a == b;
+                    try vm.stack.append(.{ .i32 = if (result) 1 else 0 });
+                    std.debug.print("i32_eq => {}\n", .{result});
+                },
+                .@"if" => {
+                    const condition = vm.stack.pop().i32;
+                    std.debug.assert(try reader.readByte() == wasm.block_empty);
+                    std.debug.print("if => {}\n", .{condition != 0});
+                    if (condition != 0) {
+                        // Execute the 'then' branch
+                        // Skip to end
+                    } else {
+                        // Skip to the 'else' branch or 'end'
+                        try vm.skipUntilElse(&idk.code);
+                        continue;
+                    }
+                },
                 .call => {
-                    const func_idx = try reader.readByte();
+                    const func_idx = try std.leb.readULEB128(uleb, reader);
                     std.debug.print("call func_idx({}) {any}\n", .{ func_idx, vm.module.type_section.?.types[func_idx] });
                     var frame = Frame{ .locals = std.ArrayList(Value).init(vm.stack.allocator), .code = .{ .buffer = vm.module.code_section.?.functions[func_idx].body, .pos = 0 } };
                     for (vm.module.type_section.?.types[func_idx].params) |_| {
@@ -344,11 +410,19 @@ const VirtualMachine = struct {
                     }
                     try vm.execute(frame);
                 },
+                .drop => {
+                    _ = vm.stack.popOrNull();
+                    std.debug.print("drop", .{});
+                },
                 .end => {
                     std.debug.print("==end==\n", .{});
                     for (vm.stack.items, 0..) |item, idx| {
                         std.debug.print("  {}: {}\n", .{ idx, item });
                     }
+                    return;
+                },
+                .@"return" => {
+                    std.debug.print("return {any}\n", .{vm.stack.getLastOrNull()});
                     return;
                 },
                 else => {
@@ -367,7 +441,7 @@ const Frame = struct {
 
 pub fn main() !void {
     const allocator = std.heap.c_allocator;
-    const file = try std.fs.cwd().openFile("test2.wasm", .{});
+    const file = try std.fs.cwd().openFile("test1.wasm", .{});
     defer file.close();
 
     const module = try Module.init(allocator, try file.readToEndAlloc(allocator, 1024 * 1024));
@@ -377,9 +451,84 @@ pub fn main() !void {
         .module = module,
     };
     defer vm.stack.deinit();
+    defer vm.frames.deinit();
 
     try vm.execute(Frame{
         .locals = std.ArrayList(Value).init(allocator),
-        .code = .{ .buffer = vm.module.code_section.?.functions[1].body, .pos = 0 },
+        .code = .{ .buffer = module.code_section.?.functions[vm.module.start_section.?.function_index].body, .pos = 0 },
+    });
+}
+
+
+test "1: add" {
+    const allocator = std.testing.allocator;
+    const file = try std.fs.cwd().openFile("test1.wasm", .{});
+    defer file.close();
+
+    var module = try Module.init(allocator, try file.readToEndAlloc(allocator, 1024 * 1024));
+    defer {
+        module.deinit(allocator);
+        allocator.free(module.bytecode);
+    }
+    var vm = VirtualMachine{
+        .frames = std.ArrayList(Frame).init(allocator),
+        .stack = std.ArrayList(Value).init(allocator),
+        .module = module,
+    };
+    defer vm.stack.deinit();
+    defer vm.frames.deinit();
+
+    var locals = std.ArrayList(Value).init(allocator);
+    try locals.append(.{ .i32 = 1 });
+    try locals.append(.{ .i32 = 127 });
+    try vm.execute(Frame{
+        .locals = locals,
+        .code = .{ .buffer = module.code_section.?.functions[0].body, .pos = 0 },
+    });
+}
+
+test "2: func call" {
+    const allocator = std.testing.allocator;
+    const file = try std.fs.cwd().openFile("test2.wasm", .{});
+    defer file.close();
+
+    var module = try Module.init(allocator, try file.readToEndAlloc(allocator, 1024 * 1024));
+    defer {
+        module.deinit(allocator);
+        allocator.free(module.bytecode);
+    }
+    var vm = VirtualMachine{
+        .frames = std.ArrayList(Frame).init(allocator),
+        .stack = std.ArrayList(Value).init(allocator),
+        .module = module,
+    };
+    defer vm.stack.deinit();
+    defer vm.frames.deinit();
+
+    const locals = std.ArrayList(Value).init(allocator);
+    try vm.execute(Frame{
+        .locals = locals,
+        .code = .{ .buffer = module.code_section.?.functions[1].body, .pos = 0 },
+    });
+
+}
+
+test "3: if" {
+    const allocator = std.heap.c_allocator;
+    const file = try std.fs.cwd().openFile("test3.wasm", .{});
+    defer file.close();
+
+    const module = try Module.init(allocator, try file.readToEndAlloc(allocator, 1024 * 1024));
+    var vm = VirtualMachine{
+        .frames = std.ArrayList(Frame).init(allocator),
+        .stack = std.ArrayList(Value).init(allocator),
+        .module = module,
+    };
+    defer vm.stack.deinit();
+    defer vm.frames.deinit();
+
+    try vm.execute(Frame{
+        .locals = std.ArrayList(Value).init(allocator),
+        .code = .{ .buffer = module.code_section.?.functions[vm.module.start_section.?.function_index].body, .pos = 0 },
     });
 }
