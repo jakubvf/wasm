@@ -229,7 +229,7 @@ const Module = struct {
         switch (section) {
             .type_section => {
                 const ts = &section.type_section;
-                const num_types = try reader.readInt(u8, .little);
+                const num_types = try std.leb.readULEB128(uleb, reader);
                 ts.types = try allocator.alloc(@TypeOf(ts.types[0]), num_types);
 
                 for (ts.types) |*t| {
@@ -237,12 +237,12 @@ const Module = struct {
                         std.log.err("non-function types are not supported\n", .{});
                         return error.InvalidWasmFile;
                     }
-                    const num_params = try reader.readInt(u8, .little);
+                    const num_params = try std.leb.readULEB128(uleb, reader);
                     const params = try allocator.alloc(wasm.Valtype, num_params);
                     for (params) |*param| {
                         param.* = try reader.readEnum(wasm.Valtype, .little);
                     }
-                    const num_results = try reader.readInt(u8, .little);
+                    const num_results = try std.leb.readULEB128(uleb, reader);
                     const returns = try allocator.alloc(wasm.Valtype, num_results);
                     for (returns) |*result| {
                         result.* = try reader.readEnum(wasm.Valtype, .little);
@@ -251,26 +251,45 @@ const Module = struct {
                     t.returns = returns;
                 }
             },
+            .import_section => {
+                const is = &section.import_section;
+                const num_imports = try std.leb.readULEB128(uleb, reader);
+                is.imports = try allocator.alloc(ImportSection.Import, num_imports);
+                for (is.imports) |*import| {
+                    const module_len = try std.leb.readULEB128(uleb, reader);
+                    import.module = try allocator.alloc(u8, module_len);
+                    if (try reader.readAll(import.module) != module_len) {
+                        return error.InvalidWasmFile;
+                    }
+                    const name_len = try std.leb.readULEB128(uleb, reader);
+                    import.name = try allocator.alloc(u8, name_len);
+                    if (try reader.readAll(import.name) != name_len) {
+                        return error.InvalidWasmFile;
+                    }
+                    import.tag = try reader.readEnum(wasm.ExternalKind, .little);
+                    import.idx = try std.leb.readULEB128(uleb, reader);
+                }
+            },
             .function_section => {
                 const fs = &section.function_section;
-                const num_functions = try reader.readInt(u8, .little);
+                const num_functions = try std.leb.readULEB128(uleb, reader);
                 fs.types = try allocator.alloc(FunctionSection.TypeIndex, num_functions);
                 for (fs.types) |*type_index| {
-                    type_index.* = try reader.readInt(u8, .little);
+                    type_index.* = try std.leb.readULEB128(uleb, reader);
                 }
             },
             .export_section => {
                 const es = &section.export_section;
-                const num_exports = try reader.readInt(u8, .little);
+                const num_exports = try std.leb.readULEB128(uleb, reader);
                 es.exports = try allocator.alloc(ExportSection.Export, num_exports);
                 for (es.exports) |*e| {
-                    const export_name_len = try reader.readInt(u8, .little);
+                    const export_name_len = try std.leb.readULEB128(uleb, reader);
                     e.name = try allocator.alloc(u8, export_name_len);
                     if (try reader.readAll(e.name) != export_name_len) {
                         return error.InvalidWasmFile;
                     }
                     e.tag = try reader.readEnum(wasm.ExternalKind, .little);
-                    e.index = try reader.readInt(u8, .little);
+                    e.index = try std.leb.readULEB128(uleb, reader);
                 }
             },
             .start_section => {
@@ -328,12 +347,19 @@ const Value = union(enum) {
 const uleb = u32;
 const ileb = i32;
 
+const ImportFunction = struct {
+    module: []const u8,
+    name: []const u8,
+    func: *const fn (vm: *VirtualMachine, params: []Value) error{NativeFunctionError}!?Value,
+};
+
 const VirtualMachine = struct {
     stack: std.ArrayList(Value),
     frames: std.ArrayList(Frame),
     module: Module,
+    import_functions: std.ArrayList(ImportFunction),
 
-    pub fn skipUntilElse(vm: *VirtualMachine, fbs: *std.io.FixedBufferStream([]const u8)) !void {
+    fn skipUntilElse(vm: *VirtualMachine, fbs: *std.io.FixedBufferStream([]const u8)) !void {
         _ = vm;
         var depth: u32 = 1;
         const reader = fbs.reader();
@@ -359,6 +385,10 @@ const VirtualMachine = struct {
                 else => {},
             }
         }
+    }
+
+    pub fn addImportFunction(vm: *VirtualMachine, module: []const u8, name: []const u8, func: *const fn (*VirtualMachine, []Value) error{NativeFunctionError}!?Value) !void {
+        try vm.import_functions.append(.{ .module = module, .name = name, .func = func});
     }
 
     pub fn execute(vm: *VirtualMachine, input: Frame) !void {
@@ -392,13 +422,46 @@ const VirtualMachine = struct {
                         continue;
                     }
                 },
+                .call => {
+                    const func_idx = try std.leb.readULEB128(uleb, reader);
+                    const is_imported_func = func_idx < vm.module.import_section.?.imports.len;
+                    if (is_imported_func) {
+                        const import = vm.module.import_section.?.imports[func_idx];
+                        for (vm.import_functions.items) |import_func| {
+                            if (std.mem.eql(u8, import.module, import_func.module) and std.mem.eql(u8, import.name, import_func.name)) {
+                                const params = try vm.stack.allocator.alloc(Value, vm.module.type_section.?.types[func_idx].params.len);
+                                defer vm.stack.allocator.free(params);
+                                for (params) |*param| {
+                                    param.* = vm.stack.pop();
+                                }
+                                std.debug.print("call imported native function idx({})\n", .{func_idx});
+                                const result = try import_func.func(vm, params);
+                                if (result) |r| {
+                                    try vm.stack.append(r);
+                                }
+                                break;
+                            }
+                        }
+                    } else {
+                        std.debug.print("call func_idx({}) {any}\n", .{ func_idx, vm.module.type_section.?.types[func_idx] });
+                        var frame = Frame{
+                            .locals = std.ArrayList(Value).init(vm.stack.allocator),
+                            .code = .{ .buffer = vm.module.code_section.?.functions[func_idx].body, .pos = 0 },
+                            .block_stack = std.ArrayList(Block).init(current_frame.block_stack.allocator),
+                        };
+                        for (vm.module.type_section.?.types[func_idx].params) |_| {
+                            try frame.locals.append(vm.stack.pop());
+                        }
+                        try vm.execute(frame);
+                    }
+                },
                 .end => {
                     if (current_frame.block_stack.popOrNull()) |b| {
                         // end of a block/loop
                         std.debug.print("end of a block/loop at 0x{x}\n", .{b.pos});
                     } else {
                         // end of a function
-                        std.debug.print("end of a function", .{});
+                        std.debug.print("end of a function\n", .{});
                         return;
                     }
                 },
@@ -466,22 +529,9 @@ const VirtualMachine = struct {
                     try vm.stack.append(.{ .i32 = result });
                     std.debug.print("i32_add {} + {} => {}\n", .{ a, b, result });
                 },
-                .call => {
-                    const func_idx = try std.leb.readULEB128(uleb, reader);
-                    std.debug.print("call func_idx({}) {any}\n", .{ func_idx, vm.module.type_section.?.types[func_idx] });
-                    var frame = Frame{
-                        .locals = std.ArrayList(Value).init(vm.stack.allocator),
-                        .code = .{ .buffer = vm.module.code_section.?.functions[func_idx].body, .pos = 0 },
-                        .block_stack = std.ArrayList(Block).init(current_frame.block_stack.allocator),
-                    };
-                    for (vm.module.type_section.?.types[func_idx].params) |_| {
-                        try frame.locals.append(vm.stack.pop());
-                    }
-                    try vm.execute(frame);
-                },
                 .drop => {
                     _ = vm.stack.popOrNull();
-                    std.debug.print("drop", .{});
+                    std.debug.print("drop\n", .{});
                 },
                 .@"return" => {
                     std.debug.print("return {any}\n", .{vm.stack.getLastOrNull()});
@@ -506,6 +556,7 @@ const Frame = struct {
     block_stack: std.ArrayList(Block),
 };
 
+
 pub fn main() !void {
     const allocator = std.heap.c_allocator;
     const file = try std.fs.cwd().openFile("test4.wasm", .{});
@@ -515,18 +566,29 @@ pub fn main() !void {
     var vm = VirtualMachine{
         .frames = std.ArrayList(Frame).init(allocator),
         .stack = std.ArrayList(Value).init(allocator),
+        .import_functions = std.ArrayList(ImportFunction).init(allocator),
         .module = module,
     };
     defer vm.stack.deinit();
     defer vm.frames.deinit();
 
+    const imported = struct {
+        fn logFunction (self: *VirtualMachine, params: []Value) error{NativeFunctionError}!?Value {
+            _ = self;
+            std.debug.print("log: {}\n", .{params[0].i32});
+            return null;
+        }
+    };
+    try vm.addImportFunction("console", "log", &imported.logFunction);
+
+    const start_function_idx = vm.module.start_section.?.function_index - vm.module.import_section.?.imports.len;
     var locals = std.ArrayList(Value).init(allocator);
-    for (module.code_section.?.functions[vm.module.start_section.?.function_index].locals) |l| {
+    for (module.code_section.?.functions[start_function_idx].locals) |l| {
         try locals.appendNTimes(.{ .i32 = 0 }, l.count);
     }
     try vm.execute(Frame{
         .locals = locals,
-        .code = .{ .buffer = module.code_section.?.functions[vm.module.start_section.?.function_index].body, .pos = 0 },
+        .code = .{ .buffer = module.code_section.?.functions[start_function_idx].body, .pos = 0 },
         .block_stack = std.ArrayList(Block).init(allocator),
     });
 }
