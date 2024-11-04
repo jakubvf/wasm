@@ -12,6 +12,7 @@ const ImportSection = struct {
         module: []u8,
         name: []u8,
         tag: wasm.ExternalKind,
+        idx: uleb,
     };
 };
 
@@ -278,19 +279,29 @@ const Module = struct {
             },
             .code_section => {
                 const cs = &section.code_section;
-                const num_functions = try reader.readInt(u8, .little);
+                const num_functions = try std.leb.readULEB128(uleb, reader);
                 cs.functions = try allocator.alloc(CodeSection.Code, num_functions);
                 for (cs.functions) |*f| {
-                    f.size = try reader.readInt(u8, .little);
-                    const num_locals = try reader.readInt(u8, .little);
+                    f.size = try std.leb.readULEB128(uleb, reader);
+
+                    // BUG: actual_body_size assumes that each ULEB128 integer is just 1 byte.
+                    var actual_body_size = f.size;
+                    const num_locals = try std.leb.readULEB128(uleb, reader);
+                    actual_body_size -= 1;
+
                     f.locals = try allocator.alloc(CodeSection.Local, num_locals);
                     for (f.locals) |*local| {
-                        std.debug.assert(false); // Untested
-                        local.count = try reader.readInt(u8, .little);
+                        local.count = try std.leb.readULEB128(uleb, reader);
                         local.type = try reader.readEnum(wasm.Valtype, .little);
+                        if (local.type != .i32) {
+                            @panic("Values other than i32 not supported!");
+                        }
+                        actual_body_size -= 2;
                     }
-                    f.body = try allocator.alloc(u8, f.size - 1); // - 1 for locals count
-                    if (try reader.readAll(f.body) != f.size - 1) {
+
+                    f.body = try allocator.alloc(u8, actual_body_size);
+                    const read = try reader.readAll(f.body);
+                    if (read != actual_body_size) {
                         return error.InvalidWasmFile;
                     }
                 }
@@ -314,13 +325,13 @@ const Value = union(enum) {
     }
 };
 
+const uleb = u32;
+const ileb = i32;
+
 const VirtualMachine = struct {
     stack: std.ArrayList(Value),
     frames: std.ArrayList(Frame),
     module: Module,
-
-    const uleb = u32;
-    const ileb = i32;
 
     pub fn skipUntilElse(vm: *VirtualMachine, fbs: *std.io.FixedBufferStream([]const u8)) !void {
         _ = vm;
@@ -329,8 +340,7 @@ const VirtualMachine = struct {
         while (try fbs.getPos() != try fbs.getEndPos()) {
             const opcode: std.wasm.Opcode = @enumFromInt(try reader.readByte());
             switch (opcode) {
-                .call,
-                .local_get => {
+                .call, .local_get => {
                     _ = try std.leb.readULEB128(uleb, reader);
                 },
                 .i32_const => {
@@ -358,23 +368,77 @@ const VirtualMachine = struct {
             frame.locals.deinit();
         }
 
-        var idk = vm.frames.items[vm.frames.items.len - 1];
-        const reader = idk.code.reader();
-        while (try idk.code.getPos() != try idk.code.getEndPos()) {
+        var current_frame = vm.frames.items[vm.frames.items.len - 1];
+        const reader = current_frame.code.reader();
+        while (try current_frame.code.getPos() != try current_frame.code.getEndPos()) {
             const opcode: std.wasm.Opcode = @enumFromInt(try reader.readByte());
             switch (opcode) {
+                .loop => {
+                    const loop_start = try current_frame.code.getPos() - 1; // -1 cause we need to save the position of the loop instruction (not of the following block type)
+                    try current_frame.block_stack.append(.{ .pos = loop_start, .is_loop = true });
+                    std.debug.assert(try reader.readByte() == wasm.block_empty);
+                    std.debug.print("loop begins at {}\n", .{loop_start});
+                },
+                .@"if" => {
+                    const condition = vm.stack.pop().i32;
+                    std.debug.assert(try reader.readByte() == wasm.block_empty);
+                    std.debug.print("if => {}\n", .{condition != 0});
+                    if (condition != 0) {
+                        // Execute the 'then' branch
+                        // Skip to end
+                    } else {
+                        // Skip to the 'else' branch or 'end'
+                        try vm.skipUntilElse(&current_frame.code);
+                        continue;
+                    }
+                },
+                .end => {
+                    if (current_frame.block_stack.popOrNull()) |b| {
+                        // end of a block/loop
+                        std.debug.print("end of a block/loop at 0x{x}\n", .{b.pos});
+                    } else {
+                        // end of a function
+                        std.debug.print("end of a function", .{});
+                        return;
+                    }
+                },
+                .br => {
+                    @panic("Implement br");
+                },
+                .br_if => {
+                    // read the depth first
+                    const depth = try std.leb.readULEB128(uleb, reader);
+
+                    // if
+                    const condition = vm.stack.pop().i32;
+                    if (condition == 0) continue;
+
+                    // br
+                    const target_block = tb: {
+                        var i: usize = 0;
+                        while (i != depth) : (i += 1) {
+                            _ = current_frame.block_stack.pop();
+                        }
+                        break :tb current_frame.block_stack.pop();
+                    };
+
+                    if (target_block.is_loop) {
+                        try current_frame.code.seekTo(target_block.pos);
+                        std.debug.print("br to loop at 0x{x}\n", .{target_block.pos});
+                    } else {
+                        @panic("TODO: Handle blocks!");
+                    }
+                },
                 .local_get => {
                     const local_index = try std.leb.readULEB128(uleb, reader);
-                    try vm.stack.append(idk.locals.items[local_index]);
+                    try vm.stack.append(current_frame.locals.items[local_index]);
                     std.debug.print("local_get idx({}) => {any}\n", .{ local_index, vm.stack.getLast() });
                 },
-                .i32_add => {
-                    const b = vm.stack.pop().i32;
-                    const a = vm.stack.pop().i32;
-                    // const result = idk.locals.items[@intCast(a)].i32 + idk.locals.items[@intCast(b)].i32;
-                    const result = a + b;
-                    try vm.stack.append(.{ .i32 = result });
-                    std.debug.print("i32_add {} + {} => {}\n", .{ a, b, result });
+                .local_set => {
+                    const local_index = try std.leb.readULEB128(uleb, reader);
+                    const value = vm.stack.pop();
+                    current_frame.locals.items[local_index] = value;
+                    std.debug.print("local_set idx({}) => {any}\n", .{ local_index, value });
                 },
                 .i32_const => {
                     const value = try std.leb.readILEB128(i32, reader);
@@ -388,23 +452,28 @@ const VirtualMachine = struct {
                     try vm.stack.append(.{ .i32 = if (result) 1 else 0 });
                     std.debug.print("i32_eq => {}\n", .{result});
                 },
-                .@"if" => {
-                    const condition = vm.stack.pop().i32;
-                    std.debug.assert(try reader.readByte() == wasm.block_empty);
-                    std.debug.print("if => {}\n", .{condition != 0});
-                    if (condition != 0) {
-                        // Execute the 'then' branch
-                        // Skip to end
-                    } else {
-                        // Skip to the 'else' branch or 'end'
-                        try vm.skipUntilElse(&idk.code);
-                        continue;
-                    }
+                .i32_lt_s => {
+                    const b = vm.stack.pop().i32;
+                    const a = vm.stack.pop().i32;
+                    const result = a < b;
+                    try vm.stack.append(.{ .i32 = if (result) 1 else 0 });
+                    std.debug.print("i32_lt_s => {}\n", .{result});
+                },
+                .i32_add => {
+                    const b = vm.stack.pop().i32;
+                    const a = vm.stack.pop().i32;
+                    const result = a + b;
+                    try vm.stack.append(.{ .i32 = result });
+                    std.debug.print("i32_add {} + {} => {}\n", .{ a, b, result });
                 },
                 .call => {
                     const func_idx = try std.leb.readULEB128(uleb, reader);
                     std.debug.print("call func_idx({}) {any}\n", .{ func_idx, vm.module.type_section.?.types[func_idx] });
-                    var frame = Frame{ .locals = std.ArrayList(Value).init(vm.stack.allocator), .code = .{ .buffer = vm.module.code_section.?.functions[func_idx].body, .pos = 0 } };
+                    var frame = Frame{
+                        .locals = std.ArrayList(Value).init(vm.stack.allocator),
+                        .code = .{ .buffer = vm.module.code_section.?.functions[func_idx].body, .pos = 0 },
+                        .block_stack = std.ArrayList(Block).init(current_frame.block_stack.allocator),
+                    };
                     for (vm.module.type_section.?.types[func_idx].params) |_| {
                         try frame.locals.append(vm.stack.pop());
                     }
@@ -413,13 +482,6 @@ const VirtualMachine = struct {
                 .drop => {
                     _ = vm.stack.popOrNull();
                     std.debug.print("drop", .{});
-                },
-                .end => {
-                    std.debug.print("==end==\n", .{});
-                    for (vm.stack.items, 0..) |item, idx| {
-                        std.debug.print("  {}: {}\n", .{ idx, item });
-                    }
-                    return;
                 },
                 .@"return" => {
                     std.debug.print("return {any}\n", .{vm.stack.getLastOrNull()});
@@ -434,14 +496,19 @@ const VirtualMachine = struct {
     }
 };
 
+const Block = struct {
+    pos: usize,
+    is_loop: bool,
+};
 const Frame = struct {
     code: std.io.FixedBufferStream([]const u8),
     locals: std.ArrayList(Value),
+    block_stack: std.ArrayList(Block),
 };
 
 pub fn main() !void {
     const allocator = std.heap.c_allocator;
-    const file = try std.fs.cwd().openFile("test1.wasm", .{});
+    const file = try std.fs.cwd().openFile("test4.wasm", .{});
     defer file.close();
 
     const module = try Module.init(allocator, try file.readToEndAlloc(allocator, 1024 * 1024));
@@ -453,12 +520,16 @@ pub fn main() !void {
     defer vm.stack.deinit();
     defer vm.frames.deinit();
 
+    var locals = std.ArrayList(Value).init(allocator);
+    for (module.code_section.?.functions[vm.module.start_section.?.function_index].locals) |l| {
+        try locals.appendNTimes(.{ .i32 = 0 }, l.count);
+    }
     try vm.execute(Frame{
-        .locals = std.ArrayList(Value).init(allocator),
+        .locals = locals,
         .code = .{ .buffer = module.code_section.?.functions[vm.module.start_section.?.function_index].body, .pos = 0 },
+        .block_stack = std.ArrayList(Block).init(allocator),
     });
 }
-
 
 test "1: add" {
     const allocator = std.testing.allocator;
@@ -484,6 +555,7 @@ test "1: add" {
     try vm.execute(Frame{
         .locals = locals,
         .code = .{ .buffer = module.code_section.?.functions[0].body, .pos = 0 },
+        .block_stack = std.ArrayList(Block).init(allocator),
     });
 }
 
@@ -509,8 +581,8 @@ test "2: func call" {
     try vm.execute(Frame{
         .locals = locals,
         .code = .{ .buffer = module.code_section.?.functions[1].body, .pos = 0 },
+        .block_stack = std.ArrayList(Block).init(allocator),
     });
-
 }
 
 test "3: if" {
@@ -530,5 +602,6 @@ test "3: if" {
     try vm.execute(Frame{
         .locals = std.ArrayList(Value).init(allocator),
         .code = .{ .buffer = module.code_section.?.functions[vm.module.start_section.?.function_index].body, .pos = 0 },
+        .block_stack = std.ArrayList(Block).init(allocator),
     });
 }
