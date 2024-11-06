@@ -359,7 +359,7 @@ const VirtualMachine = struct {
     module: Module,
     import_functions: std.ArrayList(ImportFunction),
 
-    fn skipUntilElse(vm: *VirtualMachine, fbs: *std.io.FixedBufferStream([]const u8)) !void {
+    fn skipToElseOrEnd(vm: *VirtualMachine, fbs: *std.io.FixedBufferStream([]const u8)) !void {
         _ = vm;
         var depth: u32 = 1;
         const reader = fbs.reader();
@@ -376,7 +376,7 @@ const VirtualMachine = struct {
                     depth += 1;
                     _ = try std.leb.readULEB128(uleb, reader);
                 },
-                .@"else" => {
+                .@"else", .end => {
                     depth -= 1;
                     if (depth == 0) {
                         return;
@@ -415,12 +415,21 @@ const VirtualMachine = struct {
                     std.debug.print("if => {}\n", .{condition != 0});
                     if (condition != 0) {
                         // Execute the 'then' branch
-                        // Skip to end
+                        try current_frame.block_stack.append(.{ .pos = try current_frame.code.getPos() - 2, .is_loop = false }); // if, block type => -2
+                        continue;
                     } else {
                         // Skip to the 'else' branch or 'end'
-                        try vm.skipUntilElse(&current_frame.code);
+                        try current_frame.block_stack.append(.{ .pos = try current_frame.code.getPos() - 1, .is_loop = false }); // else => -1
+                        try vm.skipToElseOrEnd(&current_frame.code);
                         continue;
                     }
+                },
+                .@"else" => {
+                    // Skip to end
+                    try vm.skipToElseOrEnd(&current_frame.code);
+                    const if_block = current_frame.block_stack.pop();
+                    std.debug.print("reached else for if at 0x{x}\n", .{if_block.pos});
+                    continue;
                 },
                 .call => {
                     const func_idx = try std.leb.readULEB128(uleb, reader);
@@ -559,7 +568,7 @@ const Frame = struct {
 
 pub fn main() !void {
     const allocator = std.heap.c_allocator;
-    const file = try std.fs.cwd().openFile("test4.wasm", .{});
+    const file = try std.fs.cwd().openFile("test5.wasm", .{});
     defer file.close();
 
     const module = try Module.init(allocator, try file.readToEndAlloc(allocator, 1024 * 1024));
@@ -648,7 +657,7 @@ test "2: func call" {
 }
 
 test "3: if" {
-    const allocator = std.heap.c_allocator;
+    const allocator = std.testing.allocator;
     const file = try std.fs.cwd().openFile("test3.wasm", .{});
     defer file.close();
 
@@ -667,3 +676,38 @@ test "3: if" {
         .block_stack = std.ArrayList(Block).init(allocator),
     });
 }
+
+test "4: loop" {
+    const allocator = std.testing.allocator;
+    const file = try std.fs.cwd().openFile("test4.wasm", .{});
+    defer file.close();
+
+    const module = try Module.init(allocator, try file.readToEndAlloc(allocator, 1024 * 1024));
+    var vm = VirtualMachine{
+        .frames = std.ArrayList(Frame).init(allocator),
+        .stack = std.ArrayList(Value).init(allocator),
+        .import_functions = std.ArrayList(ImportFunction).init(allocator),
+        .module = module,
+    };
+    defer vm.stack.deinit();
+    defer vm.frames.deinit();
+
+    const imported = struct {
+        fn logFunction (self: *VirtualMachine, params: []Value) error{NativeFunctionError}!?Value {
+            _ = self;
+            std.debug.print("log: {}\n", .{params[0].i32});
+            return null;
+        }
+    };
+    try vm.addImportFunction("console", "log", &imported.logFunction);
+
+    const start_function_idx = vm.module.start_section.?.function_index - vm.module.import_section.?.imports.len;
+    var locals = std.ArrayList(Value).init(allocator);
+    for (module.code_section.?.functions[start_function_idx].locals) |l| {
+        try locals.appendNTimes(.{ .i32 = 0 }, l.count);
+    }
+    try vm.execute(Frame{
+        .locals = locals,
+        .code = .{ .buffer = module.code_section.?.functions[start_function_idx].body, .pos = 0 },
+        .block_stack = std.ArrayList(Block).init(allocator),
+    });}
