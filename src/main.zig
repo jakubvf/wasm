@@ -79,7 +79,6 @@ const Module = struct {
     code_section: ?CodeSection = null,
     // TODO: data section
     // TODO: data count section
-    bytecode: []const u8 = undefined,
 
     const Section = union(enum) {
         type_section: TypeSection,
@@ -94,7 +93,6 @@ const Module = struct {
 
     pub fn init(allocator: std.mem.Allocator, bytecode: []const u8) !Module {
         var module = Module{};
-        module.bytecode = bytecode;
 
         var fbs = std.io.fixedBufferStream(bytecode);
         const reader = fbs.reader();
@@ -168,6 +166,20 @@ const Module = struct {
         }
         if (module.function_section) |fs| {
             allocator.free(fs.types);
+        }
+        if (module.import_section) |is| {
+            for (is.imports) |i| {
+                allocator.free(i.module);
+                allocator.free(i.name);
+            }
+            allocator.free(is.imports);
+        }
+
+        if (module.global_section) |gs| {
+            for (gs.globals) |g| {
+                allocator.free(g.init);
+            }
+            allocator.free(gs.globals);
         }
     }
 
@@ -304,7 +316,7 @@ const Module = struct {
                     const pos = try fbs.getPos();
                     const buffer = fbs.buffer[pos..];
                     const end_index = (try skipToElseOrEnd(buffer)).?;
-                    global.init = buffer[0..end_index + 1];
+                    global.init = buffer[0 .. end_index + 1];
                     try reader.skipBytes(end_index + 1, .{});
                 }
             },
@@ -412,6 +424,7 @@ fn skipToElseOrEnd(instructions: []const u8) !?usize {
 }
 
 const VirtualMachine = struct {
+    allocator: std.mem.Allocator,
     stack: std.ArrayList(Value),
     frames: std.ArrayList(Frame),
     module: Module,
@@ -419,13 +432,55 @@ const VirtualMachine = struct {
     memories: std.ArrayList(std.ArrayList(u8)),
     globals: std.ArrayList(Value),
 
+    pub fn init(allocator: std.mem.Allocator, module: Module) !VirtualMachine {
+        var vm = VirtualMachine{
+            .allocator = allocator,
+            .frames = std.ArrayList(Frame).init(allocator),
+            .stack = std.ArrayList(Value).init(allocator),
+            .import_functions = std.ArrayList(ImportFunction).init(allocator),
+            .memories = std.ArrayList(std.ArrayList(u8)).init(allocator),
+            .globals = std.ArrayList(Value).init(allocator),
+            .module = module,
+        };
+
+        if (module.memory_section) |ms| {
+            for (ms.memories) |m| {
+                std.debug.print("allocating memory: {d} pages\n", .{m.min});
+                const size = m.min * std.wasm.page_size;
+                try vm.memories.append(try std.ArrayList(u8).initCapacity(allocator, size));
+            }
+        }
+
+        if (module.global_section) |gs| {
+            for (gs.globals) |g| {
+                std.debug.print("Initializing {s} global\n", .{if (g.mutable) "mutable" else "immutable"});
+                try vm.execute(Frame{
+                    .locals = std.ArrayList(Value).init(allocator),
+                    .code = .{ .buffer = g.init, .pos = 0 },
+                    .block_stack = std.ArrayList(Block).init(allocator),
+                });
+                try vm.globals.append(vm.stack.pop());
+            }
+        }
+
+        return vm;
+    }
+
+    pub fn deinit(vm: *VirtualMachine) void {
+        vm.stack.deinit();
+        vm.frames.deinit();
+        vm.import_functions.deinit();
+        vm.memories.deinit();
+        vm.globals.deinit();
+    }
+
     pub fn addImportFunction(vm: *VirtualMachine, module: []const u8, name: []const u8, func: *const fn (*VirtualMachine, []Value) error{NativeFunctionError}!?Value) !void {
         try vm.import_functions.append(.{ .module = module, .name = name, .func = func });
     }
 
     pub fn call(vm: *VirtualMachine, id: usize, args: []const Value) !?Value {
-        std.debug.print("Calling function 0x{x}\n", .{id});
-        var locals = std.ArrayList(Value).init(vm.stack.allocator);
+        std.debug.print("call func_idx({}) {any}\n", .{ id, vm.module.type_section.?.types[id] });
+        var locals = std.ArrayList(Value).init(vm.allocator);
         for (args) |arg| {
             try locals.append(arg);
         }
@@ -435,7 +490,7 @@ const VirtualMachine = struct {
         try vm.execute(Frame{
             .locals = locals,
             .code = .{ .buffer = vm.module.code_section.?.functions[id].body, .pos = 0 },
-            .block_stack = std.ArrayList(Block).init(vm.stack.allocator),
+            .block_stack = std.ArrayList(Block).init(vm.allocator),
         });
 
         if (vm.stack.popOrNull()) |result| {
@@ -444,17 +499,16 @@ const VirtualMachine = struct {
         } else {
             return null;
         }
-
     }
 
     pub fn execute(vm: *VirtualMachine, input: Frame) !void {
         try vm.frames.append(input);
         defer {
             var frame = vm.frames.pop();
-            frame.locals.deinit();
+            frame.deinit();
         }
 
-        var current_frame = vm.frames.items[vm.frames.items.len - 1];
+        var current_frame = &vm.frames.items[vm.frames.items.len - 1];
         const reader = current_frame.code.reader();
         while (try current_frame.code.getPos() != try current_frame.code.getEndPos()) {
             const opcode: std.wasm.Opcode = @enumFromInt(try reader.readByte());
@@ -477,14 +531,15 @@ const VirtualMachine = struct {
                         // Skip to the 'else' branch or 'end'
                         const pos = try current_frame.code.getPos();
                         try current_frame.block_stack.append(.{ .pos = pos - 1, .is_loop = false }); // else => -1
-                        _ = try skipToElseOrEnd(current_frame.code.buffer[pos..]);
+                        const skip = (try skipToElseOrEnd(current_frame.code.buffer[pos..])).?;
+                        try reader.skipBytes(skip, .{});
                     }
                 },
                 .@"else" => {
                     // Skip to end
-                    // TODO: FIX IF/ELSE IT'S BROKEN CAUSE OF vm.SKIPTOELSEOREND!!!!!!!!1
-                    const pos = try current_frame.code.getPos() + 1;
-                    _ = try skipToElseOrEnd(current_frame.code.buffer[pos..]);
+                    const pos = try current_frame.code.getPos();
+                    const skip = (try skipToElseOrEnd(current_frame.code.buffer[pos..])).?;
+                    try reader.skipBytes(skip, .{});
                     const if_block = current_frame.block_stack.pop();
                     std.debug.print("reached else for if at 0x{x}\n", .{if_block.pos});
                     continue;
@@ -501,8 +556,8 @@ const VirtualMachine = struct {
                         const import = vm.module.import_section.?.imports[func_idx];
                         for (vm.import_functions.items) |import_func| {
                             if (std.mem.eql(u8, import.module, import_func.module) and std.mem.eql(u8, import.name, import_func.name)) {
-                                const params = try vm.stack.allocator.alloc(Value, vm.module.type_section.?.types[func_idx].params.len);
-                                defer vm.stack.allocator.free(params);
+                                const params = try vm.allocator.alloc(Value, vm.module.type_section.?.types[func_idx].params.len);
+                                defer vm.allocator.free(params);
                                 for (params) |*param| {
                                     param.* = vm.stack.pop();
                                 }
@@ -515,12 +570,14 @@ const VirtualMachine = struct {
                             }
                         }
                     } else {
+                        // TODO: maybe merge this with fn call
                         std.debug.print("call func_idx({}) {any}\n", .{ func_idx, vm.module.type_section.?.types[func_idx] });
                         var frame = Frame{
-                            .locals = std.ArrayList(Value).init(vm.stack.allocator),
+                            .locals = std.ArrayList(Value).init(vm.allocator),
                             .code = .{ .buffer = vm.module.code_section.?.functions[func_idx].body, .pos = 0 },
                             .block_stack = std.ArrayList(Block).init(current_frame.block_stack.allocator),
                         };
+
                         for (vm.module.type_section.?.types[func_idx].params) |_| {
                             try frame.locals.append(vm.stack.pop());
                         }
@@ -626,6 +683,11 @@ const Frame = struct {
     code: std.io.FixedBufferStream([]const u8),
     locals: std.ArrayList(Value),
     block_stack: std.ArrayList(Block),
+
+    pub fn deinit(frame: *Frame) void {
+        frame.locals.deinit();
+        frame.block_stack.deinit();
+    }
 };
 
 pub fn main() !void {
@@ -633,17 +695,13 @@ pub fn main() !void {
     const file = try std.fs.cwd().openFile("add.wasm", .{});
     defer file.close();
 
-    const module = try Module.init(allocator, try file.readToEndAlloc(allocator, 1024 * 1024));
-    var vm = VirtualMachine{
-        .frames = std.ArrayList(Frame).init(allocator),
-        .stack = std.ArrayList(Value).init(allocator),
-        .import_functions = std.ArrayList(ImportFunction).init(allocator),
-        .memories = std.ArrayList(std.ArrayList(u8)).init(allocator),
-        .globals = std.ArrayList(Value).init(allocator),
-        .module = module,
-    };
-    defer vm.stack.deinit();
-    defer vm.frames.deinit();
+    const file_contents = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(file_contents);
+
+    var module = try Module.init(allocator, file_contents);
+    defer module.deinit(allocator);
+    var vm = try VirtualMachine.init(allocator, module);
+    defer vm.deinit();
 
     const imported = struct {
         fn logFunction(self: *VirtualMachine, params: []Value) error{NativeFunctionError}!?Value {
@@ -654,27 +712,7 @@ pub fn main() !void {
     };
     try vm.addImportFunction("console", "log", &imported.logFunction);
 
-    if (module.memory_section) |ms| {
-        for (ms.memories) |m| {
-            std.debug.print("allocating memory: {d}\n", .{m.min});
-            const size = m.min * std.wasm.page_size;
-            try vm.memories.append(try std.ArrayList(u8).initCapacity(allocator, size));
-        }
-    }
-
-    if (module.global_section) |gs| {
-        for (gs.globals) |g| {
-            std.debug.print("Initializing {s} global\n", .{if (g.mutable) "mutable" else "immutable"});
-            try vm.execute(Frame{
-                .locals = std.ArrayList(Value).init(allocator),
-                .code = .{ .buffer = g.init, .pos = 0 },
-                .block_stack = std.ArrayList(Block).init(allocator),
-            });
-            try vm.globals.append(vm.stack.pop());
-        }
-    }
-
-    const result = try vm.call(0, &[_]Value{.{ .i32 = 1 }, .{ .i32 = 127 }});
+    const result = try vm.call(0, &[_]Value{ .{ .i32 = 1 }, .{ .i32 = 127 } });
     _ = result;
 }
 
@@ -683,20 +721,13 @@ test "1: add" {
     const file = try std.fs.cwd().openFile("test1.wasm", .{});
     defer file.close();
 
-    var module = try Module.init(allocator, try file.readToEndAlloc(allocator, 1024 * 1024));
-    defer {
-        module.deinit(allocator);
-        allocator.free(module.bytecode);
-    }
-    var vm = VirtualMachine{
-        .frames = std.ArrayList(Frame).init(allocator),
-        .stack = std.ArrayList(Value).init(allocator),
-        .import_functions = std.ArrayList(ImportFunction).init(allocator),
-        .memories = std.ArrayList(std.ArrayList(u8)).init(allocator),
-        .module = module,
-    };
-    defer vm.stack.deinit();
-    defer vm.frames.deinit();
+    const file_contents = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(file_contents);
+
+    var module = try Module.init(allocator, file_contents);
+    defer module.deinit(allocator);
+    var vm = try VirtualMachine.init(allocator, module);
+    defer vm.deinit();
 
     var locals = std.ArrayList(Value).init(allocator);
     try locals.append(.{ .i32 = 1 });
@@ -713,20 +744,13 @@ test "2: func call" {
     const file = try std.fs.cwd().openFile("test2.wasm", .{});
     defer file.close();
 
-    var module = try Module.init(allocator, try file.readToEndAlloc(allocator, 1024 * 1024));
-    defer {
-        module.deinit(allocator);
-        allocator.free(module.bytecode);
-    }
-    var vm = VirtualMachine{
-        .frames = std.ArrayList(Frame).init(allocator),
-        .stack = std.ArrayList(Value).init(allocator),
-        .import_functions = std.ArrayList(ImportFunction).init(allocator),
-        .memories = std.ArrayList(std.ArrayList(u8)).init(allocator),
-        .module = module,
-    };
-    defer vm.stack.deinit();
-    defer vm.frames.deinit();
+    const file_contents = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(file_contents);
+
+    var module = try Module.init(allocator, file_contents);
+    defer module.deinit(allocator);
+    var vm = try VirtualMachine.init(allocator, module);
+    defer vm.deinit();
 
     const locals = std.ArrayList(Value).init(allocator);
     try vm.execute(Frame{
@@ -741,16 +765,13 @@ test "3: if" {
     const file = try std.fs.cwd().openFile("test3.wasm", .{});
     defer file.close();
 
-    const module = try Module.init(allocator, try file.readToEndAlloc(allocator, 1024 * 1024));
-    var vm = VirtualMachine{
-        .frames = std.ArrayList(Frame).init(allocator),
-        .stack = std.ArrayList(Value).init(allocator),
-        .import_functions = std.ArrayList(ImportFunction).init(allocator),
-        .memories = std.ArrayList(std.ArrayList(u8)).init(allocator),
-        .module = module,
-    };
-    defer vm.stack.deinit();
-    defer vm.frames.deinit();
+    const file_contents = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(file_contents);
+
+    var module = try Module.init(allocator, file_contents);
+    defer module.deinit(allocator);
+    var vm = try VirtualMachine.init(allocator, module);
+    defer vm.deinit();
 
     try vm.execute(Frame{
         .locals = std.ArrayList(Value).init(allocator),
@@ -764,16 +785,13 @@ test "4: loop" {
     const file = try std.fs.cwd().openFile("test4.wasm", .{});
     defer file.close();
 
-    const module = try Module.init(allocator, try file.readToEndAlloc(allocator, 1024 * 1024));
-    var vm = VirtualMachine{
-        .frames = std.ArrayList(Frame).init(allocator),
-        .stack = std.ArrayList(Value).init(allocator),
-        .import_functions = std.ArrayList(ImportFunction).init(allocator),
-        .memories = std.ArrayList(std.ArrayList(u8)).init(allocator),
-        .module = module,
-    };
-    defer vm.stack.deinit();
-    defer vm.frames.deinit();
+    const file_contents = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(file_contents);
+
+    var module = try Module.init(allocator, file_contents);
+    defer module.deinit(allocator);
+    var vm = try VirtualMachine.init(allocator, module);
+    defer vm.deinit();
 
     const imported = struct {
         fn logFunction(self: *VirtualMachine, params: []Value) error{NativeFunctionError}!?Value {
@@ -801,16 +819,14 @@ test "5: if fix" {
     const file = try std.fs.cwd().openFile("test5.wasm", .{});
     defer file.close();
 
-    const module = try Module.init(allocator, try file.readToEndAlloc(allocator, 1024 * 1024));
-    var vm = VirtualMachine{
-        .frames = std.ArrayList(Frame).init(allocator),
-        .stack = std.ArrayList(Value).init(allocator),
-        .import_functions = std.ArrayList(ImportFunction).init(allocator),
-        .memories = std.ArrayList(std.ArrayList(u8)).init(allocator),
-        .module = module,
-    };
-    defer vm.stack.deinit();
-    defer vm.frames.deinit();
+    const file_contents = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(file_contents);
+
+    var module = try Module.init(allocator, file_contents);
+    defer module.deinit(allocator);
+
+    var vm = try VirtualMachine.init(allocator, module);
+    defer vm.deinit();
 
     const imported = struct {
         fn logFunction(self: *VirtualMachine, params: []Value) error{NativeFunctionError}!?Value {
@@ -822,13 +838,5 @@ test "5: if fix" {
     try vm.addImportFunction("console", "log", &imported.logFunction);
 
     const start_function_idx = vm.module.start_section.?.function_index - vm.module.import_section.?.imports.len;
-    var locals = std.ArrayList(Value).init(allocator);
-    for (module.code_section.?.functions[start_function_idx].locals) |l| {
-        try locals.appendNTimes(.{ .i32 = 0 }, l.count);
-    }
-    try vm.execute(Frame{
-        .locals = locals,
-        .code = .{ .buffer = module.code_section.?.functions[start_function_idx].body, .pos = 0 },
-        .block_stack = std.ArrayList(Block).init(allocator),
-    });
+    _ = try vm.call(start_function_idx, &[_]Value{});
 }
