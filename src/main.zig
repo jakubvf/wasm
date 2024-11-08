@@ -1,6 +1,8 @@
 const std = @import("std");
 const wasm = std.wasm;
 
+const CustomSection = struct {};
+
 const TypeSection = struct {
     types: []std.wasm.Type,
 };
@@ -81,6 +83,7 @@ const Module = struct {
     // TODO: data count section
 
     const Section = union(enum) {
+        custom_section: CustomSection,
         type_section: TypeSection,
         import_section: ImportSection,
         function_section: FunctionSection,
@@ -105,6 +108,9 @@ const Module = struct {
         while (try fbs.getEndPos() != try fbs.getPos()) {
             const section = try parseSection(reader, allocator);
             switch (section) {
+                .custom_section => |s| {
+                    std.debug.print("{any}\n", .{s});
+                },
                 .type_section => |s| {
                     module.type_section = s;
                     std.debug.print("{any}\n", .{s});
@@ -222,6 +228,7 @@ const Module = struct {
 
     fn parseSection(reader: anytype, allocator: std.mem.Allocator) !Section {
         var section: Section = switch (try reader.readEnum(wasm.Section, .little)) {
+            .custom => .{ .custom_section = undefined },
             .type => .{ .type_section = undefined },
             .import => .{ .import_section = undefined },
             .function => .{ .function_section = undefined },
@@ -232,12 +239,14 @@ const Module = struct {
             .element => return error.UnsupportedWasmSection,
             .code => .{ .code_section = undefined },
             .data => return error.UnsupportedWasmSection,
-            .custom => return error.UnsupportedWasmSection,
             else => return error.UnsupportedWasmSection,
         };
-        _ = try std.leb.readULEB128(u64, reader);
+        const section_size = try std.leb.readULEB128(u64, reader);
 
         switch (section) {
+            .custom_section => {
+                try reader.skipBytes(section_size, .{});
+            },
             .type_section => {
                 const ts = &section.type_section;
                 const num_types = try std.leb.readULEB128(uleb, reader);
@@ -316,7 +325,7 @@ const Module = struct {
                     const pos = try fbs.getPos();
                     const buffer = fbs.buffer[pos..];
                     const end_index = (try skipToElseOrEnd(buffer)).?;
-                    global.init = buffer[0 .. end_index + 1];
+                    global.init = try allocator.dupe(u8, buffer[0 .. end_index + 1]);
                     try reader.skipBytes(end_index + 1, .{});
                 }
             },
@@ -453,7 +462,7 @@ const VirtualMachine = struct {
 
         if (module.global_section) |gs| {
             for (gs.globals) |g| {
-                std.debug.print("Initializing {s} global\n", .{if (g.mutable) "mutable" else "immutable"});
+                std.debug.print("initializing {s} global\n", .{if (g.mutable) "mutable" else "immutable"});
                 try vm.execute(Frame{
                     .locals = std.ArrayList(Value).init(allocator),
                     .code = .{ .buffer = g.init, .pos = 0 },
