@@ -67,6 +67,16 @@ const CodeSection = struct {
     };
 };
 
+const DataSection = struct {
+    data: []Data,
+
+    const Data = struct {
+        memory_index: u32,
+        offset: u32,
+        data: []u8,
+    };
+};
+
 const Module = struct {
     // TODO: custom section
     type_section: ?TypeSection = null,
@@ -79,7 +89,7 @@ const Module = struct {
     start_section: ?StartSection = null,
     // TODO: element section
     code_section: ?CodeSection = null,
-    // TODO: data section
+    data_section: ?DataSection = null,
     // TODO: data count section
 
     const Section = union(enum) {
@@ -92,6 +102,7 @@ const Module = struct {
         export_section: ExportSection,
         start_section: StartSection,
         code_section: CodeSection,
+        data_section: DataSection,
     };
 
     pub fn init(allocator: std.mem.Allocator, bytecode: []const u8) !Module {
@@ -141,6 +152,10 @@ const Module = struct {
                 },
                 .code_section => |s| {
                     module.code_section = s;
+                    std.debug.print("{any}\n", .{s});
+                },
+                .data_section => |s| {
+                    module.data_section = s;
                     std.debug.print("{any}\n", .{s});
                 },
             }
@@ -238,7 +253,7 @@ const Module = struct {
             .start => .{ .start_section = undefined },
             .element => return error.UnsupportedWasmSection,
             .code => .{ .code_section = undefined },
-            .data => return error.UnsupportedWasmSection,
+            .data => .{ .data_section = undefined },
             else => return error.UnsupportedWasmSection,
         };
         const section_size = try std.leb.readULEB128(u64, reader);
@@ -320,7 +335,6 @@ const Module = struct {
                 for (gs.globals) |*global| {
                     global.type = try reader.readEnum(wasm.Valtype, .little);
                     global.mutable = try reader.readByte() == 1;
-
                     const fbs = reader.context;
                     const pos = try fbs.getPos();
                     const buffer = fbs.buffer[pos..];
@@ -353,7 +367,6 @@ const Module = struct {
                 cs.functions = try allocator.alloc(CodeSection.Code, num_functions);
                 for (cs.functions) |*f| {
                     f.size = try std.leb.readULEB128(uleb, reader);
-
                     // BUG: actual_body_size assumes that each ULEB128 integer is just 1 byte.
                     var actual_body_size = f.size;
                     const num_locals = try std.leb.readULEB128(uleb, reader);
@@ -372,6 +385,30 @@ const Module = struct {
                     f.body = try allocator.alloc(u8, actual_body_size);
                     const read = try reader.readAll(f.body);
                     if (read != actual_body_size) {
+                        return error.InvalidWasmFile;
+                    }
+                }
+            },
+            .data_section => {
+                const ds = &section.data_section;
+                const num_data = try std.leb.readULEB128(uleb, reader);
+                ds.data = try allocator.alloc(DataSection.Data, num_data);
+                for (ds.data) |*data| {
+                    const data_type = try std.leb.readULEB128(uleb, reader);
+                    if (data_type != 0) {
+                        @panic("Type of data not supported!");
+                    }
+                    data.memory_index = 0; // assuming because of data_type
+                    if (!try reader.isBytes("\x41")) {
+                        @panic("Initialization of data not supported!");
+                    }
+                    data.offset = try std.leb.readULEB128(uleb, reader);
+                    if (!try reader.isBytes("\x0B")) {
+                        @panic("Initialization of data not supported!");
+                    }
+                    const data_size = try std.leb.readULEB128(uleb, reader);
+                    data.data = try allocator.alloc(u8, data_size);
+                    if (try reader.readAll(data.data) != data_size) {
                         return error.InvalidWasmFile;
                     }
                 }
@@ -438,7 +475,7 @@ const VirtualMachine = struct {
     frames: std.ArrayList(Frame),
     module: Module,
     import_functions: std.ArrayList(ImportFunction),
-    memories: std.ArrayList(std.ArrayList(u8)),
+    memories: std.ArrayList([]u8),
     globals: std.ArrayList(Value),
 
     pub fn init(allocator: std.mem.Allocator, module: Module) !VirtualMachine {
@@ -447,7 +484,7 @@ const VirtualMachine = struct {
             .frames = std.ArrayList(Frame).init(allocator),
             .stack = std.ArrayList(Value).init(allocator),
             .import_functions = std.ArrayList(ImportFunction).init(allocator),
-            .memories = std.ArrayList(std.ArrayList(u8)).init(allocator),
+            .memories = std.ArrayList([]u8).init(allocator),
             .globals = std.ArrayList(Value).init(allocator),
             .module = module,
         };
@@ -456,7 +493,16 @@ const VirtualMachine = struct {
             for (ms.memories) |m| {
                 std.debug.print("allocating memory: {d} pages\n", .{m.min});
                 const size = m.min * std.wasm.page_size;
-                try vm.memories.append(try std.ArrayList(u8).initCapacity(allocator, size));
+                const allocated = try allocator.alloc(u8, size);
+                try vm.memories.append(allocated);
+            }
+        }
+
+        if (module.data_section) |gs| {
+            for (gs.data) |d| {
+                std.debug.print("initializing memory {d} at offset {d}\n", .{d.memory_index, d.offset});
+                const memory = vm.memories.items[d.memory_index];
+                @memcpy(memory.ptr + d.offset, d.data);
             }
         }
 
@@ -701,7 +747,7 @@ const Frame = struct {
 
 pub fn main() !void {
     const allocator = std.heap.c_allocator;
-    const file = try std.fs.cwd().openFile("add.wasm", .{});
+    const file = try std.fs.cwd().openFile("hello_world.wasm", .{});
     defer file.close();
 
     const file_contents = try file.readToEndAlloc(allocator, 1024 * 1024);
